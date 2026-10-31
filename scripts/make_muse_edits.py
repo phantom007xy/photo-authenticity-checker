@@ -107,6 +107,8 @@ def main():
     parser.add_argument("--prompts", choices=list(PROMPTS), default="test")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--spend", action="store_true")
+    parser.add_argument("--recover", action="store_true",
+                        help="record edits whose files exist but are missing from the manifest (no API call)")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -138,9 +140,36 @@ def main():
     todo = [j for j in jobs if j["id"] not in done][: args.limit]
     print(f"{len(photos)} photos without people; {len(jobs)} edits planned ({sum(j['kind'] == 'local' for j in jobs)} "
           f"local, {sum(j['kind'] == 'whole' for j in jobs)} whole-image); {len(todo)} to do -> at most ${len(todo) * COST:.2f}")
-    if not args.spend:
+    if args.recover:
+        # 31 Oct: after a crash, the old script's worker threads kept making (and paying for) edits that were saved
+        # as files but never written to the manifest. Record those from the files, without any API call.
+        recovered = []
+        for job in todo:
+            stem = args.out_dir / job["id"]
+            edited_path = Path(f"{stem}_edited.png")
+            if not edited_path.exists() or not Path(f"{stem}_mask.png").exists():
+                continue
+            with Image.open(f"{stem}_original.jpg") as o, Image.open(edited_path) as e, Image.open(f"{stem}_mask.png") as m:
+                recovered.append({**job, "width": o.width, "height": o.height, "edited_width": e.width,
+                                  "edited_height": e.height, "status": "ok",
+                                  "changed_share": round(float((np.asarray(m.convert("L")) > 0).mean()), 4)})
+        new_file = not manifest.exists() or manifest.stat().st_size == 0
+        with open(manifest, "a", newline="") as out:
+            writer = csv.DictWriter(out, fieldnames=FIELDS, lineterminator="\n")
+            if new_file:
+                writer.writeheader()
+            writer.writerows({k: r.get(k, "") for k in FIELDS} for r in recovered)
+        print(f"recovered {len(recovered)} edits from their files (no API call); {len(todo) - len(recovered)} still missing")
+    elif not args.spend:
         print("dry run: nothing was sent. Add --spend to edit.")
         return
+    else:
+        run_edits(args, todo, manifest)
+    write_lists(args, manifest)
+
+
+def run_edits(args, todo, manifest):
+    """The paid part: one Muse Image edit per job, every result written to the manifest at once."""
     key = meta_api.api_key()
 
     def edit(job):
@@ -194,9 +223,11 @@ def main():
             print(f"  {row['id']} {row['kind']:<5} {row['status']:<8} changed {row.get('changed_share', '')} | {row['prompt'][:50]}",
                   flush=True)
 
+
+def write_lists(args, manifest):
     # Image list for the tests: originals (real, 0), local edits (2, with mask), whole-image edits (1).
     with open(manifest, newline="") as f:
-        made = [r for r in csv.DictReader(f) if r["status"] == "ok"]
+        made = list({r["id"]: r for r in csv.DictReader(f) if r["status"] == "ok"}.values())  # one row per edit
     rows = []
     for r in made:
         rows.append({"path": str(args.out_dir / f"{r['id']}_original.jpg"), "label": 0, "source": "muse_edits/original", "mask": ""})
